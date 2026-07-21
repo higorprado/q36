@@ -190,6 +190,22 @@ meaningful generation-speed win.
 
 ## Speed
 
+Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor limited
+to 500-1500 MHz, 85 °C thermal ceiling — a hot summer in Italy). All runs
+use the Vulkan backend with greedy decoding, `--gen-tokens 128`, and the
+long context story prompt. Resident (full RAM) runs use Q8_0 K / Q4_0 V
+cache. SSD streaming runs use F16 KV cache.
+
+| Machine | Quant | Prompt | Prefill | Generation |
+| --- | ---: | ---: | ---: | ---: |
+| BC-250 (40 CU) | q2 | 2048 ctx | 351.60 t/s | 52.69 t/s |
+| BC-250 (40 CU) | q2 | 10240 ctx | 305.44 t/s | 39.99 t/s |
+| BC-250 (40 CU) | q2 | 32768 ctx | 154.20 t/s | 20.50 t/s |
+| BC-250 (40 CU) | q2 SSD | 2048 ctx | 40.08 t/s | 14.91 t/s |
+| BC-250 (40 CU) | q2-q4 SSD | 2048 ctx | 35.55 t/s | 10.80 t/s |
+
+![BC-250 t/s](speed-bench/bc250_ts.svg)
+
 Use `q36-bench` for reproducible prefill and decode measurements. Release
 builds also have a conservative BC-250 performance gate under
 `make benchmark-gate`; record results on the same board and power state when
