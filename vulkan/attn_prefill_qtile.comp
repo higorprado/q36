@@ -1,0 +1,274 @@
+#version 460
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+/* Query-tiled prefill attention: one workgroup per (head, QT-token tile,
+ * SPAN-key span) serves QT queries at once, so each K row and V element is
+ * fetched once per tile instead of once per token — the fused/split kernels
+ * stream the whole causal K/V range per token with zero reuse across a
+ * chunk's queries, which made attention the growing prefill cost.
+ *
+ * Numerics are the invariance-critical part: every query keeps the exact
+ * per-token arithmetic of attn_decode_split — same 64-key tile walk, same
+ * quad-strided f32 dot + clustered add, same redundant online-softmax
+ * bookkeeping, same t-ordered l/acc adds — only the scheduling changes.
+ * A token therefore produces bit-identical partials whether it arrives
+ * here, in the split kernel, or (single span) in attn_decode_fused, and
+ * attn_combine folds them identically (warm==cold holds).
+ *
+ * Per-query causal ends differ inside a tile: the key loop runs to the
+ * tile's last valid query's span end and earlier queries gate themselves
+ * out (skipped tiles leave m/l/acc untouched, partial tiles clamp their
+ * own tile_n), matching exactly the tiles the split kernel would run. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Qbuf {
+    float q[];
+};
+
+layout(set = 0, binding = 1) readonly buffer Kcache {
+    uint kc[];
+};
+
+layout(set = 0, binding = 2) readonly buffer Vcache {
+    uint vc[];
+};
+
+layout(set = 0, binding = 3) readonly buffer Sinks {
+    float sinks[];
+};
+
+layout(set = 0, binding = 4) writeonly buffer Partials {
+    float part[];
+};
+
+layout(push_constant) uniform Push {
+    uint pos0;
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint n_spans;
+    uint n_tok;
+    uint has_sinks;
+    uint k_type;
+    uint v_type;
+    uint k_row_bytes;
+    uint v_row_bytes;
+} pc;
+
+#define TILE 64u
+#define SPAN 512u
+#define QT 8u
+
+shared float sh_q[QT * 256u];
+shared float sh_w[QT * TILE];
+
+uint load_k_u8(uint off) {
+    uint word = kc[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 255u;
+}
+
+uint load_v_u8(uint off) {
+    uint word = vc[off >> 2u];
+    return (word >> ((off & 3u) * 8u)) & 255u;
+}
+
+float load_k_f16(uint off) {
+    return unpackHalf2x16(load_k_u8(off) | (load_k_u8(off + 1u) << 8u)).x;
+}
+
+float load_v_f16(uint off) {
+    return unpackHalf2x16(load_v_u8(off) | (load_v_u8(off + 1u) << 8u)).x;
+}
+
+int i8(uint v) {
+    return v >= 128u ? int(v) - 256 : int(v);
+}
+
+float kc_at(uint tok, uint kvh, uint i) {
+    if (pc.k_type == 0u) {
+        return load_k_f16(tok * pc.k_row_bytes + (kvh * pc.head_dim + i) * 2u);
+    }
+    uint block_bytes = pc.k_type == 1u ? 34u : 18u;
+    uint head_bytes = ((pc.head_dim + 31u) / 32u) * block_bytes;
+    uint base = tok * pc.k_row_bytes + kvh * head_bytes + (i / 32u) * block_bytes;
+    if (pc.k_type == 2u) {
+        uint j = i & 31u;
+        uint q = load_k_u8(base + 2u + (j & 15u));
+        q = j < 16u ? q & 15u : q >> 4u;
+        return load_k_f16(base) * float(int(q) - 8);
+    }
+    return load_k_f16(base) * float(i8(load_k_u8(base + 2u + (i & 31u))));
+}
+
+float vc_at(uint tok, uint kvh, uint i) {
+    if (pc.v_type == 0u) {
+        uint idx = (tok * pc.v_row_bytes) / 2u + kvh * pc.head_dim + i;
+        uint word = vc[idx >> 1u];
+        vec2 pair = unpackHalf2x16(word);
+        return (idx & 1u) == 0u ? pair.x : pair.y;
+    }
+    uint block_bytes = pc.v_type == 1u ? 34u : 18u;
+    uint head_bytes = ((pc.head_dim + 31u) / 32u) * block_bytes;
+    uint base = tok * pc.v_row_bytes + kvh * head_bytes + (i / 32u) * block_bytes;
+    if (pc.v_type == 2u) {
+        uint j = i & 31u;
+        uint q = load_v_u8(base + 2u + (j & 15u));
+        q = j < 16u ? q & 15u : q >> 4u;
+        return load_v_f16(base) * float(int(q) - 8);
+    }
+    return load_v_f16(base) * float(i8(load_v_u8(base + 2u + (i & 31u))));
+}
+
+float vc_at_f16(uint idx) {
+    uint word = vc[idx >> 1u];
+    vec2 pair = unpackHalf2x16(word);
+    return (idx & 1u) == 0u ? pair.x : pair.y;
+}
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint tok0 = gl_WorkGroupID.y * QT;
+    uint span = gl_WorkGroupID.z;
+    uint jn = min(QT, pc.n_tok - tok0);
+    uint span0 = span * SPAN;
+    /* The tile's key walk is bounded by its LAST query's causal end; the
+     * earlier queries clamp themselves per tile below. */
+    uint n_kv_max = pc.pos0 + tok0 + jn;
+    if (span0 >= n_kv_max) return;
+    uint span_end_max = min(span0 + SPAN, n_kv_max);
+
+    uint kvh = h / (pc.n_head / pc.n_head_kv);
+    uint half_dim = pc.head_dim >> 1;
+    float scale = 1.0 / sqrt(float(pc.head_dim));
+
+    for (uint e = tid; e < jn * 256u; e += 256u) {
+        uint j = e >> 8u;
+        uint d = e & 255u;
+        if (d < pc.head_dim) {
+            sh_q[e] = q[((tok0 + j) * pc.n_head + h) * pc.head_dim + d];
+        }
+    }
+    barrier();
+
+    float m[QT];
+    float l[QT];
+    float acc[QT];
+    float nm[QT];
+    for (uint j = 0u; j < QT; j++) {
+        m[j] = span == 0u && pc.has_sinks != 0u ? sinks[h] : -3.402823466e38;
+        l[j] = 0.0;
+        acc[j] = 0.0;
+    }
+
+    for (uint base = span0; base < span_end_max; base += TILE) {
+        uint tile_n = min(TILE, span_end_max - base);
+
+        /* Per-query tile bound, hoisted once: queries whose causal range
+         * ends before this tile get tn 0 and skip every phase.  All loops
+         * below run constant QT trips (with uniform skips) so the per-query
+         * state arrays stay in registers instead of spilling to scratch. */
+        uint tn[QT];
+        for (uint j = 0u; j < QT; j++) {
+            uint send_j = min(span0 + SPAN, pc.pos0 + tok0 + j + 1u);
+            tn[j] = j < jn && base < send_j ? min(TILE, send_j - base) : 0u;
+        }
+
+        /* Scores: each K word is loaded once and dotted against all QT
+         * queries (per-query accumulators), so K traffic no longer scales
+         * with the tile's query count.  Per query the w-order and the
+         * clustered add match the split kernel exactly.  tn is
+         * workgroup-uniform, so the clustered add stays uniform. */
+        uint key_t = tid >> 2;
+        uint quad = tid & 3u;
+        {
+            float dot[QT];
+            for (uint j = 0u; j < QT; j++) dot[j] = 0.0;
+            uint tn_max = 0u;
+            for (uint j = 0u; j < QT; j++) tn_max = max(tn_max, tn[j]);
+            if (key_t < tn_max) {
+                uint key = base + key_t;
+                if (pc.k_type == 0u) {
+                    uint kbase = (key * pc.n_head_kv + kvh) * half_dim;
+                    for (uint w = quad; w < half_dim; w += 4u) {
+                        vec2 kp = unpackHalf2x16(kc[kbase + w]);
+                        for (uint j = 0u; j < QT; j++) {
+                            dot[j] += sh_q[j * 256u + 2u * w] * kp.x + sh_q[j * 256u + 2u * w + 1u] * kp.y;
+                        }
+                    }
+                } else {
+                    for (uint w = quad; w < half_dim; w += 4u) {
+                        vec2 kp = vec2(kc_at(key, kvh, 2u * w), kc_at(key, kvh, 2u * w + 1u));
+                        for (uint j = 0u; j < QT; j++) {
+                            dot[j] += sh_q[j * 256u + 2u * w] * kp.x + sh_q[j * 256u + 2u * w + 1u] * kp.y;
+                        }
+                    }
+                }
+            }
+            for (uint j = 0u; j < QT; j++) {
+                if (tn[j] == 0u) continue;
+                float d = key_t < tn[j] ? dot[j] : 0.0;
+                d = subgroupClusteredAdd(d, 4u);
+                if (quad == 0u && key_t < tn[j]) {
+                    sh_w[j * TILE + key_t] = d * scale;
+                }
+            }
+        }
+        barrier();
+
+        /* Online softmax bookkeeping, redundantly per thread, per query. */
+        for (uint j = 0u; j < QT; j++) {
+            if (tn[j] == 0u) { nm[j] = m[j]; continue; }
+            float tmax = -3.402823466e38;
+            for (uint t = 0u; t < tn[j]; t++) tmax = max(tmax, sh_w[j * TILE + t]);
+            float n = max(m[j], tmax);
+            float r = exp(m[j] - n);
+            l[j] *= r;
+            acc[j] *= r;
+            nm[j] = n;
+        }
+        barrier();
+        for (uint e = tid; e < QT * TILE; e += 256u) {
+            uint j = e / TILE;
+            uint t = e % TILE;
+            if (t < tn[j]) sh_w[e] = exp(sh_w[e] - nm[j]);
+        }
+        barrier();
+
+        /* V accumulation: one cache load per (key, dim), reused by every
+         * query; each query's l/acc chains stay in t order. */
+        uint vrow = pc.n_head_kv * pc.head_dim;
+        uint vbase = base * vrow + kvh * pc.head_dim + tid;
+        for (uint t = 0u; t < tile_n; t++) {
+            float vv;
+            if (pc.v_type == 0u) {
+                vv = tid < pc.head_dim ? vc_at_f16(vbase + t * vrow) : 0.0;
+            } else {
+                vv = tid < pc.head_dim ? vc_at(base + t, kvh, tid) : 0.0;
+            }
+            for (uint j = 0u; j < QT; j++) {
+                if (t < tn[j]) {
+                    float w = sh_w[j * TILE + t];
+                    l[j] += w;
+                    acc[j] += w * vv;
+                }
+            }
+        }
+        for (uint j = 0u; j < QT; j++) m[j] = nm[j];
+        barrier();
+    }
+
+    for (uint j = 0u; j < jn; j++) {
+        uint n_kv_j = pc.pos0 + tok0 + j + 1u;
+        if (span0 >= n_kv_j) continue;
+        uint pbase = (((tok0 + j) * pc.n_head + h) * pc.n_spans + span) * (pc.head_dim + 2u);
+        if (tid < pc.head_dim) part[pbase + tid] = acc[j];
+        if (tid == 0u) {
+            part[pbase + pc.head_dim] = m[j];
+            part[pbase + pc.head_dim + 1u] = l[j];
+        }
+    }
+}
